@@ -1,0 +1,9 @@
+node_modules/
+dist/
+# Solo SQLite local en raíz — no ignorar src/data (catálogo de marcas)
+/data/
+temp/
+logs/
+.env
+*.exe
+*.log

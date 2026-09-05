@@ -1,0 +1,190 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Vehiculo {
+  id_subasta                  String
+  id_lote                     String   @default("")
+  portal                      String
+  enlace                      String
+  titulo                      String
+  marca                       String   @default("")
+  modelo                      String   @default("")
+  marcaNorm                   String   @default("")
+  modeloNorm                  String   @default("")
+  versionTokens               String[] @default([])
+  ccaaNorm                    String   @default("")
+  puja_minima                 Float    @default(0)
+  fecha_inicio                String?
+  fecha_fin                   DateTime?
+  provincia                   String?
+  comunidad_autonoma          String?
+  publicado_publico           Boolean  @default(false)
+  publicado_vip               Boolean  @default(false)
+  telegram_message_id_publico Int?
+  telegram_message_id_vip     Int?
+  /// true = marca/modelo ya revisados por el job de limpieza de títulos
+  revisado                    Boolean  @default(false)
+  created_at                  DateTime @default(now())
+  updated_at                  DateTime @updatedAt
+
+  notificaciones NotificacionVIPEnviada[]
+
+  @@id([id_subasta, id_lote, portal])
+  @@index([portal])
+  @@index([publicado_publico])
+  @@index([publicado_vip])
+  @@index([marca])
+  @@index([marcaNorm, modeloNorm])
+  @@index([ccaaNorm])
+  @@index([fecha_fin])
+  @@index([puja_minima])
+  @@index([updated_at])
+  @@index([revisado])
+  @@map("vehiculos")
+}
+
+model UsuarioVIP {
+  id                 Int       @id @default(autoincrement())
+  telegram_id        String    @unique
+  email              String?
+  estado             String    @default("Pendiente_Pago")
+  stripe_customer_id String?   @unique
+  /// Mensajes de prueba del asesor IA ya consumidos (máx. 3 en freemium)
+  ai_pruebas_usadas  Int       @default(0)
+  /// Cupo VIP: mensajes del día / semana (Europa/Madrid)
+  ai_uso_diario      Int       @default(0)
+  ai_uso_semanal     Int       @default(0)
+  /// Consultas de inventario / recuperación con ficha+enlace por día (máx. 3 VIP)
+  ai_inv_uso_diario  Int       @default(0)
+  ai_inv_clave_dia   String    @default("")
+  /// Alternativas por enlace caído (máx. 1/día VIP)
+  ai_broken_uso_diario Int     @default(0)
+  /// Clave día YYYY-MM-DD y lunes de la semana YYYY-MM-DD
+  ai_clave_dia       String    @default("")
+  ai_clave_semana    String    @default("")
+  /// Cuando pasó a Cancelado (fin VIP). Tras 48h se purgan datos personales conservando telegram_id.
+  vip_ended_at       DateTime?
+  /// Última purga de datos personales (filtros, msgs, email…) — el ID se conserva
+  datos_purgados_at  DateTime?
+  /// Horario digests VIP (/horario): ISO 1=Lun … 7=Dom
+  digest_days         Int[]    @default([1, 2, 3, 4, 5, 6, 7])
+  /// Hora inicio inclusiva Europe/Madrid (default 8)
+  digest_start_hour   Int      @default(8)
+  /// Hora fin exclusiva Europe/Madrid (default 21 → hasta 20:59)
+  digest_end_hour     Int      @default(21)
+  /// Intervalo entre digests regulares en horas (1–4, default 2)
+  digest_interval_h   Int      @default(2)
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+  cancel_at          DateTime?
+
+  filtros        UsuarioFiltros?
+  notificaciones NotificacionVIPEnviada[]
+
+  @@index([estado])
+  @@index([email])
+  @@map("usuarios_vip")
+}
+
+/// Clave/valor ops (p. ej. message_id del contador VIP en chat admin)
+model AppMeta {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("app_meta")
+}
+
+model ScraperLog {
+  id                    Int      @id @default(autoincrement())
+  url                   String
+  vehiculos_encontrados Int      @default(0)
+  vehiculos_nuevos      Int      @default(0)
+  error                 String?
+  duracion_ms           Int?
+  ejecutado_en          DateTime @default(now())
+
+  @@map("scraper_log")
+}
+
+/// VIP radar — brand/model/specs + CCAA + max starting bid
+model UsuarioFiltros {
+  telegram_id String @id
+
+  /// Legacy category labels (kept for migration; matching prefers marcaNorm)
+  tipos       String @default("[]")
+  comunidades String @default("[]")
+  puja_maxima Float?
+  origenes    String @default("[]")
+  etiquetas   String @default("[]")
+  estados     String @default("[]")
+
+  marcaNorm   String?
+  modeloNorm  String?
+  /// JSON string array of selected version/spec tokens
+  versions    String @default("[]")
+  /// Canonical CCAA norms selected (JSON string[])
+  ccaaNorms   String @default("[]")
+  /// Fingerprint of last saved radar for queue resync
+  fingerprint String?
+
+  usuario UsuarioVIP @relation(fields: [telegram_id], references: [telegram_id], onDelete: Cascade)
+
+  @@index([marcaNorm, modeloNorm])
+  @@map("usuarios_filtros")
+}
+
+model NotificacionVIPEnviada {
+  id                  Int      @id @default(autoincrement())
+  telegram_id         String
+  id_subasta          String
+  id_lote             String   @default("")
+  portal              String
+  telegram_message_id Int      @default(0)
+  enviado_at          DateTime @default(now())
+
+  usuario  UsuarioVIP @relation(fields: [telegram_id], references: [telegram_id], onDelete: Cascade)
+  vehiculo Vehiculo   @relation(fields: [id_subasta, id_lote, portal], references: [id_subasta, id_lote, portal], onDelete: Cascade)
+
+  @@unique([telegram_id, id_subasta, id_lote, portal])
+  @@index([telegram_id])
+  @@index([id_subasta, id_lote, portal])
+  @@map("notificaciones_vip_enviadas")
+}
+
+/// Pre-aggregated inventory for filter UX (brands/models/versions/CCAA/puja)
+model InventoryStats {
+  id           Int      @id @default(autoincrement())
+  marcaNorm    String
+  modeloNorm   String   @default("")
+  versionToken String   @default("")
+  ccaaNorm     String   @default("")
+  count        Int      @default(0)
+  pujaMin      Float?
+  pujaMax      Float?
+  pujaAvg      Float?
+  updatedAt    DateTime @updatedAt
+
+  @@unique([marcaNorm, modeloNorm, versionToken, ccaaNorm])
+  @@index([marcaNorm, modeloNorm])
+  @@index([ccaaNorm])
+  @@map("inventory_stats")
+}
+
+/// Page-window resume per portal (discovery bands → steady 1–5)
+model ScraperState {
+  portal          String   @id
+  nextWindowStart Int      @default(1)
+  fullyCrawled    Boolean  @default(false)
+  lastPageSeen    Int      @default(0)
+  lastRunAt       DateTime?
+  updatedAt       DateTime @updatedAt
+
+  @@map("scraper_state")
+}

@@ -1,0 +1,218 @@
+# ============================================
+# Alertas VIP Subastas — stack dual (seguridad)
+# postgres + redis (solo red interna)
+# alertas-bot  = Telegram + Stripe + digests + backup (APP_ROLE=app)
+# alertas-scraper = scrapers (APP_ROLE=scraper, sin TG/Stripe/OpenAI/R2)
+# Puerto app solo en 127.0.0.1 → NPM reverse proxy
+# Nota: pids solo en deploy.resources.limits.pids (no mezclar con pids_limit)
+# ============================================
+
+x-security: &svc_security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  ipc: private
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: alertas-vip-subastas-postgres
+    restart: on-failure
+    <<: *svc_security
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-subastas_vip}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 768M
+          pids: 200
+        reservations:
+          cpus: '0.10'
+          memory: 128M
+
+  redis:
+    image: redis:7-alpine
+    container_name: alertas-vip-subastas-redis
+    restart: on-failure
+    # Sin cap_drop: ALL — rompe AOF/appendonlydir
+    security_opt:
+      - no-new-privileges:true
+    ipc: private
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "yes"
+      - --bind
+      - 0.0.0.0
+      - --protected-mode
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 320M
+          pids: 128
+        reservations:
+          cpus: '0.05'
+          memory: 64M
+
+  alertas-bot:
+    build: .
+    container_name: alertas-vip-subastas-bot
+    restart: on-failure
+    user: "1000:1000"
+    <<: *svc_security
+    ports:
+      - "127.0.0.1:3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      APP_ROLE: app
+      TZ: Europe/Madrid
+      PORT: ${PORT:-3002}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      REDIS_URL: ${REDIS_URL:?Set REDIS_URL in .env}
+      NOTIFIER_INTERVAL_MINUTES: ${NOTIFIER_INTERVAL_MINUTES:-120}
+      NOTIFIER_TICK_MINUTES: ${NOTIFIER_TICK_MINUTES:-5}
+      MATCHING_INTERVAL_MINUTES: ${MATCHING_INTERVAL_MINUTES:-30}
+      NOTIF_MAX_MESSAGES_PER_USER: ${NOTIF_MAX_MESSAGES_PER_USER:-1}
+      NOTIF_MAX_PENDING_PER_USER: ${NOTIF_MAX_PENDING_PER_USER:-3}
+      NOTIF_HARD_START_HOUR: ${NOTIF_HARD_START_HOUR:-7}
+      NOTIF_HARD_END_HOUR: ${NOTIF_HARD_END_HOUR:-23}
+      NOTIF_WINDOW_START_HOUR: ${NOTIF_WINDOW_START_HOUR:-8}
+      NOTIF_WINDOW_END_HOUR: ${NOTIF_WINDOW_END_HOUR:-21}
+      DIGEST_WARMUP_MIN_MINUTES: ${DIGEST_WARMUP_MIN_MINUTES:-5}
+      DIGEST_WARMUP_MAX_MINUTES: ${DIGEST_WARMUP_MAX_MINUTES:-15}
+      DIGEST_WARMUP_QUOTA_HOURS: ${DIGEST_WARMUP_QUOTA_HOURS:-24}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+      BACKUP_CRON: "${BACKUP_CRON:-0 6 * * *}"
+      OPS_REMINDER_CRON: "${OPS_REMINDER_CRON:-0 9 1 * *}"
+      AI_VIP_DAILY_MAX: ${AI_VIP_DAILY_MAX:-20}
+      AI_VIP_WEEKLY_MAX: ${AI_VIP_WEEKLY_MAX:-140}
+      AI_INVENTORY_DAILY_MAX: ${AI_INVENTORY_DAILY_MAX:-3}
+      AI_INVENTORY_DAILY_MAX_FREE: ${AI_INVENTORY_DAILY_MAX_FREE:-1}
+      AI_BROKEN_LINK_DAILY_MAX: ${AI_BROKEN_LINK_DAILY_MAX:-1}
+      AI_TIMEOUT_MS: ${AI_TIMEOUT_MS:-120000}
+      STRIPE_WEBHOOK_RATE_LIMIT_MAX: ${STRIPE_WEBHOOK_RATE_LIMIT_MAX:-60}
+      STRIPE_WEBHOOK_RATE_LIMIT_WINDOW_MS: ${STRIPE_WEBHOOK_RATE_LIMIT_WINDOW_MS:-60000}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:3002/health | grep -q '\"status\":\"ok\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 90s
+    command: >
+      sh -c "node dist/scripts/migrate-boot.js && node dist/index.js"
+    networks:
+      - internal
+      - npm_proxy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.55'
+          memory: 768M
+          pids: 256
+        reservations:
+          cpus: '0.10'
+          memory: 192M
+
+  alertas-scraper:
+    build: .
+    container_name: alertas-vip-subastas-scraper
+    restart: on-failure
+    user: "1000:1000"
+    <<: *svc_security
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      alertas-bot:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      APP_ROLE: scraper
+      TZ: Europe/Madrid
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      REDIS_URL: ${REDIS_URL:?Set REDIS_URL in .env}
+      REQUEST_DELAY_MS: ${REQUEST_DELAY_MS:-2000}
+      SCRAPER_WINDOW_SIZE: ${SCRAPER_WINDOW_SIZE:-5}
+      SCRAPER_STEADY_PAGES: ${SCRAPER_STEADY_PAGES:-5}
+      SCRAPER_STEADY_ONLY: ${SCRAPER_STEADY_ONLY:-true}
+      SCRAPER_CRON: "${SCRAPER_CRON:-0 8,14,20 * * 1-5}"
+      LOG_DIR: /app/logs
+    healthcheck:
+      # Scraper no expone HTTP: PID 1 = node dist/index.js (comando del contenedor)
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    command: ["node", "dist/index.js"]
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: '0.70'
+          memory: 1024M
+          pids: 512
+        reservations:
+          cpus: '0.15'
+          memory: 256M
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge
+  npm_proxy:
+    external: true
+    name: ${NPM_NETWORK:-nginx-proxy_default}
